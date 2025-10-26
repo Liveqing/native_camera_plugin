@@ -1,10 +1,9 @@
 import 'package:flutter/material.dart';
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
-
-import 'package:flutter/services.dart';
 import 'package:native_camera_plugin/native_camera_plugin.dart';
+import 'utils/camera_util.dart';
+import 'simple_camera_example.dart';
 
 void main() {
   runApp(const MyApp());
@@ -31,15 +30,16 @@ class CameraDemo extends StatefulWidget {
 }
 
 class _CameraDemoState extends State<CameraDemo> {
+  final _cameraUtil = CameraUtil.instance;
   final _nativeCameraPlugin = NativeCameraPlugin();
 
   String _platformVersion = 'Unknown';
   bool _cameraPermission = false;
   bool _cameraAvailable = false;
   String? _lastImagePath;
-  Uint8List? _lastImageData;
   bool _isLoading = false;
   String _statusMessage = '';
+  int _lastImageSize = 0;
 
   @override
   void initState() {
@@ -80,7 +80,10 @@ class _CameraDemoState extends State<CameraDemo> {
 
   Future<void> _requestCameraPermission() async {
     try {
-      final granted = await _nativeCameraPlugin.requestCameraPermission();
+      final granted = await _cameraUtil.ensureCameraPermission(
+        context: context,
+        showDialog: true,
+      );
       setState(() {
         _cameraPermission = granted;
       });
@@ -92,7 +95,7 @@ class _CameraDemoState extends State<CameraDemo> {
 
   Future<void> _checkCameraAvailability() async {
     try {
-      final available = await _nativeCameraPlugin.isCameraAvailable();
+      final available = await _cameraUtil.isCameraAvailable();
       setState(() {
         _cameraAvailable = available;
       });
@@ -102,31 +105,30 @@ class _CameraDemoState extends State<CameraDemo> {
   }
 
   Future<void> _takePicture({CameraOptions? options}) async {
-    if (!_cameraPermission) {
-      _showMessage('请先授予相机权限');
-      return;
-    }
-
-    if (!_cameraAvailable) {
-      _showMessage('相机不可用');
-      return;
-    }
-
     setState(() {
       _isLoading = true;
       _statusMessage = '正在拍照...';
     });
 
     try {
-      final result = await _nativeCameraPlugin.takePicture(options);
+      final result = await _cameraUtil.quickTakePicture(
+        context: context,
+        options: options,
+        showMessages: false, // 我们自己处理消息显示
+      );
 
       if (result.success) {
+        // 获取图片文件大小
+        final fileSize = await _cameraUtil.getImageFileSize(result.imagePath);
+
         setState(() {
           _lastImagePath = result.imagePath;
-          _lastImageData = result.imageData;
-          _statusMessage = '拍照成功！';
+          _lastImageSize = fileSize;
+          _statusMessage = '拍照成功！文件大小: ${_cameraUtil.formatFileSize(fileSize)}';
         });
-        _showMessage('拍照成功！图片路径: ${result.imagePath}');
+        _showMessage(
+          '拍照成功！图片路径: ${_cameraUtil.getImageFileName(result.imagePath)}',
+        );
       } else {
         _showMessage('拍照失败: ${result.error}');
         setState(() {
@@ -137,6 +139,59 @@ class _CameraDemoState extends State<CameraDemo> {
       _showMessage('拍照异常: $e');
       setState(() {
         _statusMessage = '拍照异常: $e';
+      });
+    } finally {
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _takeBatchPictures() async {
+    setState(() {
+      _isLoading = true;
+      _statusMessage = '准备批量拍照...';
+    });
+
+    try {
+      final results = await _cameraUtil.takeBatchPictures(
+        count: 3,
+        context: context,
+        onProgress: (current, total) {
+          setState(() {
+            _statusMessage = '正在拍照: $current/$total';
+          });
+        },
+      );
+
+      int successCount = results.where((r) => r.success).length;
+      int failCount = results.length - successCount;
+
+      // 显示最后一张成功的照片
+      final lastSuccess = results.lastWhere(
+        (r) => r.success,
+        orElse: () => CameraResult.error('无成功照片'),
+      );
+
+      if (lastSuccess.success) {
+        final fileSize = await _cameraUtil.getImageFileSize(
+          lastSuccess.imagePath,
+        );
+        setState(() {
+          _lastImagePath = lastSuccess.imagePath;
+          _lastImageSize = fileSize;
+        });
+      }
+
+      setState(() {
+        _statusMessage = '批量拍照完成！成功: $successCount 张，失败: $failCount 张';
+      });
+
+      _showMessage('批量拍照完成！成功拍摄 $successCount 张照片');
+    } catch (e) {
+      _showMessage('批量拍照异常: $e');
+      setState(() {
+        _statusMessage = '批量拍照异常: $e';
       });
     } finally {
       setState(() {
@@ -171,26 +226,72 @@ class _CameraDemoState extends State<CameraDemo> {
     return Card(
       child: Column(
         children: [
-          Container(
-            height: 200,
-            width: double.infinity,
-            decoration: BoxDecoration(
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(12),
+          GestureDetector(
+            onTap: () {
+              _cameraUtil.showImagePreview(
+                context: context,
+                imagePath: _lastImagePath!,
+                title: '拍照预览',
+              );
+            },
+            child: Container(
+              height: 200,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(12),
+                ),
+                image: DecorationImage(
+                  image: FileImage(File(_lastImagePath!)),
+                  fit: BoxFit.cover,
+                ),
               ),
-              image: DecorationImage(
-                image: FileImage(File(_lastImagePath!)),
-                fit: BoxFit.cover,
+              child: Stack(
+                children: [
+                  // 添加一个半透明的点击提示
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: Container(
+                      padding: const EdgeInsets.all(6),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.zoom_in, color: Colors.white, size: 16),
+                          SizedBox(width: 4),
+                          Text(
+                            '点击查看',
+                            style: TextStyle(color: Colors.white, fontSize: 12),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
           ),
           Padding(
             padding: const EdgeInsets.all(8.0),
-            child: Text(
-              '图片路径: ${_lastImagePath!.split('/').last}',
-              style: Theme.of(context).textTheme.bodySmall,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '文件名: ${_cameraUtil.getImageFileName(_lastImagePath)}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                if (_lastImageSize > 0)
+                  Text(
+                    '文件大小: ${_cameraUtil.formatFileSize(_lastImageSize)}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+              ],
             ),
           ),
         ],
@@ -204,6 +305,19 @@ class _CameraDemoState extends State<CameraDemo> {
       appBar: AppBar(
         title: const Text('Native Camera Plugin Demo'),
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        actions: [
+          IconButton(
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (context) => const SimpleCameraExample(),
+                ),
+              );
+            },
+            icon: const Icon(Icons.lightbulb_outline),
+            tooltip: '查看简单示例',
+          ),
+        ],
       ),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16.0),
@@ -342,6 +456,18 @@ class _CameraDemoState extends State<CameraDemo> {
                               ),
                         icon: const Icon(Icons.folder_open),
                         label: const Text('临时文件拍照'),
+                      ),
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    // 批量拍照
+                    SizedBox(
+                      width: double.infinity,
+                      child: ElevatedButton.icon(
+                        onPressed: _isLoading ? null : _takeBatchPictures,
+                        icon: const Icon(Icons.burst_mode),
+                        label: const Text('批量拍照 (3张)'),
                       ),
                     ),
                   ],
